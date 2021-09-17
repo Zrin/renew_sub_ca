@@ -1,0 +1,151 @@
+#!/bin/bash
+#
+# renew_sub_ca
+# Renew TinyCA managed SubCA certificate while keeping all keys and the serial,
+# so that previously issued end-entity certificates will keep their validity
+#
+# Author: Zrin Žiborski
+#
+
+NAME="$1"
+DAYS=3650
+MD='sha256'
+
+if [[ -z "$1" || "$1" =~ ^- ]]; then
+	echo "usage: $0 <DN search string>"
+	echo "   will search for matching line in index.txt and prompt to renew the cert"
+	exit 1
+fi
+
+function check_file_exists() # path
+{
+	[[ -e "$1" ]] || { echo "not found: $1"; exit 2; }
+}
+
+[[ -d certs ]] || { echo "not present: certs/"; exit 2; }
+[[ -d req ]] || { echo "not present: req/"; exit 2; }
+
+declare -a files=(
+index.txt
+openssl.cnf
+cacert.pem
+cacert.key
+serial
+)
+
+for fn in "${files[@]}"; do
+	check_file_exists "$fn"
+done
+
+grep -q '[ ca_ca ]' openssl.cnf || { echo "section ca_ca in openssl.cnf is missing"; exit 2; }
+
+readarray -t ils < <(grep -- "$NAME" index.txt)
+[[ -n "$ils" ]] || { echo 'not found'; exit 2; }
+for iln in "${ils[@]}"; do
+	echo "found: $iln"
+done
+[[ "${#ils[@]}" == 1 ]] || { echo 'found more than one entry'; exit 2; }
+IFS=$':' read s t r serial _ sub <<<"${ils[0]//$'\t'/:}"
+
+cn="${sub##*/}"
+cn="${cn#CN=}"
+
+echo "
+subject: $sub
+cn: $cn
+state: $s
+time: $t
+reason: $r
+serial: $serial
+"
+
+check_file_exists "newcerts/$serial.pem"
+
+subject="$(openssl x509 -noout -subject -in "newcerts/$serial.pem")"
+[[ -n "$subject" ]] || { echo "failed to verify newcerts/$serial.pem"; exit 2; }
+subject="${subject#subject=}"
+
+cn2="${subject##*, }"
+cn2="${cn2#CN = }"
+[[ "$cn2" == "$cn" ]] || { echo "CN does not match: '$cn2' <> '$cn'"; exit 2; }
+
+echo "found cert with subject: $subject"
+
+typeok=0
+while read ln; do
+	case $typeok in
+		0) if [[ "$ln" =~ ^X509v3BasicConstraints: ]]; then typeok=1; echo -n "$ln "; fi ;;
+		1) echo "$ln"; if [[ "$ln" =~ CA:TRUE ]]; then typeok=2; else typeok=0; fi; break; ;;
+	esac
+done < <(openssl x509 -noout -text -in "newcerts/$serial.pem" | tr -d '[:blank:]')
+if ((typeok != 2)); then
+	echo "this is not a Sub CA certificate!"
+	exit 3
+fi
+
+certfn=''
+declare -i c=${#cn}
+c+=1
+for fn in certs/*.pem; do
+	n="${fn##*/}"
+	n="${n%.pem}"
+	n="$(base64 -d <<<"$n")"
+	#echo "checking ${n:0:$c}"
+	[[ "${n:0:$c}" == "$cn": ]] && {
+		certfn="$fn"
+		break
+	}
+done
+
+[[ -n "$certfn" ]] || { echo "cert not found in ./certs"; exit 2; }
+
+check_file_exists "$certfn"
+echo "found $certfn"
+
+codedfn="${certfn#*/}"
+reqfn="req/$codedfn"
+check_file_exists "$reqfn"
+echo "found $reqfn"
+
+sub1="$(openssl x509 -noout -subject -in "$certfn")"
+sub1="${sub1#subject=}"
+[[ "$sub1" == "$subject" ]] || { echo "subject mismatch"; echo "'$sub1' <> '$subject'"; exit 2; }
+
+read -p "renew this certificate ($DAYS days)? [y/n] " yn
+[[ "$yn" == y ]] || exit 4
+
+mv -v serial serial.save
+echo "$serial" >serial
+mv -v "newcerts/$serial.pem" "newcerts/$serial.pem.save"
+mv -v index.txt index.txt.save
+grep -v "/CN=$cn" index.txt.save >index.txt
+
+function sign_and_check()
+{
+	openssl ca -notext -config openssl.cnf -name ca_ca -in "$reqfn" -days $DAYS -preserveDN -md $MD -keyfile cacert.key -cert cacert.pem -outdir ./newcerts/ \
+	|| return 1
+	[[ -e "newcerts/$serial.pem" ]] || { echo "failed to create newcerts/$serial.pem"; return 2; }
+	nsub="$(openssl x509 -noout -subject -in "newcerts/$serial.pem")"
+	[[ -n "$nsub" ]] || { echo "failed to verify new newcerts/$serial.pem"; return 2; }
+	nsub="${nsub#subject=}"
+	[[ "$nsub" == "$subject" ]] || { echo "mismatch: '$nsub' <> '$subject'"; return 3; }
+	return 0
+}
+
+if sign_and_check; then
+	echo "sucessfully created new cert"
+	rm -v "newcerts/$serial.pem.save"
+	tr \\t : <index.txt | sort -t : -k 4 | tr : \\t >index.txt.new
+	mv -v index.txt.new index.txt
+	mv -v index.save index.txt.old
+	cp -v "newcerts/$serial.pem" "$certfn"
+	echo "DON'T forget to update cachain.pem in the sub CA dir"
+else
+	echo "failed. rolling back..."
+	mv -v "newcerts/$serial.pem.save" "newcerts/$serial.pem"
+	mv -v index.txt.save index.txt
+fi
+mv -v serial.save serial
+echo "updating db"
+openssl ca -config openssl.cnf -updatedb
+echo "done!"
