@@ -139,7 +139,7 @@ if sign_and_check; then
 	mv -v index.txt.new index.txt
 	mv -v index.save index.txt.old
 	cp -v "newcerts/$serial.pem" "$certfn"
-	echo "DON'T forget to update cachain.pem in the sub CA dir"
+	echo "DON'T forget to update cacert.pem and cachain.pem in the sub CA dir"
 else
 	echo "failed. rolling back..."
 	mv -v "newcerts/$serial.pem.save" "newcerts/$serial.pem"
